@@ -14,9 +14,8 @@ def mark_dirty(method):
 
 @dataclass
 class BoxFilterConfig:
-    outlierQuantiles: list[float] = field(default_factory=lambda: [0.075, 0.25])
-    bwThreshold: float = 0.3
-    bwInvert: bool = True
+    outlierQuantile: float = 0.1
+    invert: bool = True
     boundaryPixelRemoval: list[int] = field(default_factory=lambda: [400, 200])
     pixelSizeThresholds: list[int] = field(default_factory=lambda: [2_500, 50_000])
     targetSize: list[float] = field(default_factory=lambda: [210., 350.])
@@ -29,29 +28,26 @@ class BoxFilter:
         self._isclean = False
 
         # Intermediate step containers
-        self._0_outlierFree = None
-        self._1_bw = None
-        self._2_culled = None
-        self._3_noIslands = None
-        self._4_aspectRatioFiltered = None
+        self._outlierFree = None
+        self._denoised = None
+        self._culled = None
+        self._aspectRatioFiltered = None
 
         self.result = None
     
     def filter(self):
         print("Commencing image processing...")
 
-        print("  1/5 - Removing outliers...")
+        print("  1/4 - Removing outliers...")
         self.removeOutliers()
-        print("  2/5 - Black-white filtering...")
-        self.blackWhiteFilter()
-        print("  3/5 - Culling boundary pixel...")
+        print("  2/4 - Removing outliers...")
+        self.denoise()
+        print("  3/4 - Culling boundary pixel...")
         self.cullBoundary()
-        print("  4/5 - Removing pixel islands...")
-        self.removeIslands()
-        print("  5/5 - Aspect ratio filter...")
+        print("  4/4 - Aspect ratio filter...")
         self.aspectRatioFilter()
 
-        self.result = np.copy(self._4_aspectRatioFiltered)
+        self.result = np.copy(self._aspectRatioFiltered)
         self._isclean = True
 
     @mark_dirty
@@ -62,33 +58,23 @@ class BoxFilter:
         `outlierQuantiles` is set to the respective quantile values. Then the image is normalised
         to a [0,1] intensity range.
         """
-        # Clamp everything into the threshold range
         imgs = np.copy(self.imgs)
-        thresholds = np.quantile(imgs, self.config.outlierQuantiles, [1, 2])
-        lower = thresholds[0,:,None,None]
-        upper = thresholds[1,:,None,None]
-        imgs = np.clip(imgs, lower, upper)
-
-        # Normalise data to [0, 1] range
-        imgs = imgs - lower
-        imgs = imgs / (upper - lower)
-        
-        self._0_outlierFree = imgs
-    
-    @mark_dirty
-    def blackWhiteFilter(self):
-        """
-        Creates a black and white map.
-        Sets all pixel below the config parameter `bwThreshold` to 0 and to 1 otherwise.
-        If the config parameter `bwInvert` is set to true, the images are inverted afterwards.
-        """
-        imgs = np.copy(self._0_outlierFree)
-        imgs[imgs <  self.config.bwThreshold] = 0
-        imgs[imgs >= self.config.bwThreshold] = 1
-        if self.config.bwInvert:
+        threshold = np.quantile(imgs, self.config.outlierQuantile, [1, 2])
+        imgs[imgs < threshold[:,None,None]] = 0
+        imgs[imgs > 0] = 1
+        if self.config.invert:
             imgs = 1 - imgs # invert
 
-        self._1_bw = imgs
+        self._outlierFree = imgs
+    
+    @mark_dirty
+    def denoise(self):
+        imgs = np.copy(self._outlierFree)
+        for n in range(imgs.shape[0]):
+            imgs[n,:,:] = nd.binary_opening(
+                imgs[n,:,:], structure = nd.generate_binary_structure(2, 2), iterations=1
+            )
+        self._denoised = imgs
     
     @mark_dirty
     def cullBoundary(self):
@@ -97,7 +83,7 @@ class BoxFilter:
         The amount of removed pixels are specified in the config parameter `boundaryPixelRemoval`,
         in either left-right and top-bottom, or left, top, right, bottom order.
         """
-        imgs = np.copy(self._1_bw)
+        imgs = np.copy(self._denoised)
         if len(self.config.boundaryPixelRemoval) == 2:
             l, t = self.config.boundaryPixelRemoval
             r, b = l, t
@@ -109,45 +95,27 @@ class BoxFilter:
         imgs[:,-r:,:] = 0
         imgs[:,:,:t] = 0
         imgs[:,:,-b:] = 0
-        self._2_culled = imgs.copy()
-    
-    @mark_dirty
-    def removeIslands(self):
-        """
-        Removes pixel island below and above certain thresholds.
-        At this point we expect that the features we want to extract is given by a feature with a
-        roughly known pixel count. Every other feature with less or more pixel than specified in
-        the config parameter `pixelSizeThreshold` will thusly be removed.
-        """
-        imgs = np.copy(self._2_culled)
-        tSmall, tLarge = self.config.pixelSizeThresholds
-        for n in range(imgs.shape[0]):
-            s = nd.generate_binary_structure(2,2)
-            labelled, _ = nd.label(imgs[n,:,:], structure=s)
-            for indices in nd.value_indices(labelled).values():
-                # Remove regions larger or smaller than a pixel threshold
-                if indices[0].size < tSmall or indices[0].size > tLarge:
-                    imgs[n,indices] = 0
-        self._3_noIslands = imgs
+        self._culled = imgs.copy()
 
     @mark_dirty
     def aspectRatioFilter(self):
         """
         Filter features on their physical dimensions.
         This checks whether the remaining features have an aspect ratio as specified by the
-        config parameter `targetAspect`.
+        config parameter `targetAspect` or whether they fall outside of the pixel size limits
+        (per coordinate axis) defined by `targetSize`.
         """
-        imgs = np.copy(self._3_noIslands)
-        # sLow, sHigh = self.config.targetSize
+        imgs = np.copy(self._culled)
+        sLow, sHigh = self.config.targetSize
         maxAspect = self.config.targetAspect
         for n in range(imgs.shape[0]):
             labelled, _ = nd.label(imgs[n])
             for indices in nd.value_indices(labelled).values():
                 dX = np.max(indices[0]) - np.min(indices[0])
                 dY = np.max(indices[1]) - np.min(indices[1])
-                if maxAspect > dX / dY > (1/maxAspect): #or sLow > min(dX,dY) or sHigh < max(dX,dY):
-                    imgs[n,indices] = 0
-        self._4_aspectRatioFiltered = imgs
+                if not maxAspect > dX / (dY + 1e-6) > (1/maxAspect) or sLow > min(dX, dY) or sHigh < max(dX, dY):
+                    imgs[n,*indices] = 0
+        self._aspectRatioFiltered = imgs
 
     def visualise(self):
         if self.result is None:
@@ -159,24 +127,19 @@ class BoxFilter:
             )
         
         nRows = self.imgs.shape[0]
-        _, axes = plt.subplots(nRows, 4, figsize=(16, 4*nRows)) 
+        _, axes = plt.subplots(nRows, 3, figsize=(12, 4*nRows)) 
         for index in range(nRows):
-            axes[index,0].imshow(self._1_bw[index,:,:], cmap='gray')
+            axes[index,0].imshow(self._outlierFree[index,:,:], cmap='gray')
             axes[index,0].set_title('Quantile Filtered')
             axes[index,0].axis('off')
             
-            labelled, _ = nd.label(self._2_culled[index,:,:])
-            axes[index,1].imshow(labelled)
-            axes[index,1].set_title('Black white and outlier filtered - labelled')
+            axes[index,1].imshow(self._culled[index,:,:], cmap='gray')
+            axes[index,1].set_title('Denoised and culled')
             axes[index,1].axis('off')
 
-            axes[index,2].imshow(self._3_noIslands[index,:,:])
-            axes[index,2].set_title('Removed islands')
+            axes[index,2].imshow(self.result[index,:,:], cmap='gray')
+            axes[index,2].set_title('Aspect ratio filtered')
             axes[index,2].axis('off')
-
-            axes[index,3].imshow(self.result[index,:,:], cmap='gray')
-            axes[index,3].set_title('Aspect Area filtered')
-            axes[index,3].axis('off')
 
         plt.tight_layout()
         plt.show()
