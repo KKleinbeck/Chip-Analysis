@@ -1,0 +1,10 @@
+Inputs:
+  - input_stack
+
+PipelineSteps:
+  - DisplayId: Remove Outliers
+    ProcessStep: RemoveOutliers
+    Inputs:
+      input_stack: input_stack
+    Deliverables:
+      filtered_stack: bw_image
